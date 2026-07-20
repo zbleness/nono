@@ -573,6 +573,38 @@ pub fn apply_auto_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Se
     apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::AutoSeccompFallback)
 }
 
+/// Whether an `open()` errno indicates the target path is simply absent (or its
+/// backing device is unavailable) rather than a permission or policy problem.
+///
+/// `ENOENT` (missing file), `ENXIO` (no such device or address, e.g. `/dev/tty`
+/// with no controlling terminal), and `ENODEV` (no such device) all mean there
+/// is no usable filesystem object to grant access to.
+fn is_absent_path_errno(raw_os_error: Option<i32>) -> bool {
+    matches!(
+        raw_os_error,
+        Some(libc::ENOENT | libc::ENXIO | libc::ENODEV)
+    )
+}
+
+/// Whether a Landlock `PathFd` open failure means the path is absent (or its
+/// backing device is unavailable) rather than a permission or policy problem.
+///
+/// Landlock must open a path fd to add a filesystem rule, so a policy that names
+/// a path missing from the current system (for example a terminal device such
+/// as `/dev/tty`, `/dev/console`, or `/dev/pts` inside a non-interactive
+/// container) would otherwise hard-fail sandbox construction. Skipping such a
+/// path is fail-secure: Landlock rules only *grant* access, so omitting one can
+/// never widen the sandbox. Paths that exist but fail to open for other reasons
+/// (for example `EACCES`) still hard-fail.
+fn landlock_open_error_is_absent(err: &landlock::PathFdError) -> bool {
+    match err {
+        landlock::PathFdError::OpenCall { source, .. } => {
+            is_absent_path_errno(source.raw_os_error())
+        }
+        _ => false,
+    }
+}
+
 /// Internal implementation shared by all public `apply_*` entry points.
 fn apply_with_abi_inner(
     caps: &CapabilitySet,
@@ -881,7 +913,20 @@ fn apply_with_abi_inner(
             access
         );
 
-        let path_fd = PathFd::new(&cap.resolved)?;
+        let path_fd = match PathFd::new(&cap.resolved) {
+            Ok(fd) => fd,
+            Err(err) if landlock_open_error_is_absent(&err) => {
+                info!(
+                    "Skipping Landlock rule for '{}': {err}. The path is unavailable on \
+                     this system (e.g. a terminal device such as /dev/tty in a \
+                     non-interactive or container environment); the sandbox will be \
+                     applied without it.",
+                    cap.resolved.display()
+                );
+                continue;
+            }
+            Err(err) => return Err(NonoError::from(err)),
+        };
         ruleset = ruleset
             .add_rule(PathBeneath::new(path_fd, access))
             .map_err(|e| {
@@ -2741,6 +2786,22 @@ pub fn read_mmsghdr_dests(pid: u32, msgvec_ptr: u64, vlen: u64) -> Result<Vec<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_path_errno_matches_missing_and_unavailable_devices() {
+        // ENXIO is the /dev/tty-without-controlling-terminal case from issue #862.
+        assert!(is_absent_path_errno(Some(libc::ENXIO)));
+        assert!(is_absent_path_errno(Some(libc::ENOENT)));
+        assert!(is_absent_path_errno(Some(libc::ENODEV)));
+    }
+
+    #[test]
+    fn absent_path_errno_rejects_permission_and_success() {
+        // Permission and other errors must still hard-fail sandbox construction.
+        assert!(!is_absent_path_errno(Some(libc::EACCES)));
+        assert!(!is_absent_path_errno(Some(libc::EPERM)));
+        assert!(!is_absent_path_errno(None));
+    }
 
     #[test]
     fn test_is_supported() {
